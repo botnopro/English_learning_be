@@ -3,8 +3,6 @@ const mongoose = require('mongoose');
 const wordSchema = new mongoose.Schema({
   englishWord: {
     type: String,
-    required: true,
-    unique: true,
     trim: true
   },
   vietnameseWord: {
@@ -52,5 +50,14 @@ const wordSchema = new mongoose.Schema({
     default: Date.now
   }
 });
+
+// Only enforce uniqueness when englishWord is provided and not empty.
+wordSchema.index(
+  { englishWord: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { englishWord: { $exists: true, $type: 'string', $ne: '' } }
+  }
+);
 
 module.exports = mongoose.model('Word', wordSchema);

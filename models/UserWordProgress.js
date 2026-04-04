@@ -26,6 +26,42 @@ const userWordProgressSchema = new mongoose.Schema(
     lastReviewedAt: {
       type: Date,
     },
+    personalNote: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    personalTags: [
+      {
+        type: String,
+        trim: true,
+      },
+    ],
+    personalEnglishWord: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    personalVietnameseWord: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    isPublic: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    correctStreak: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    incorrectStreak: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
   },
   {
     timestamps: true,

@@ -5,6 +5,7 @@ const mongoose = require('mongoose');
 const connectDB = require('../config/database');
 const User = require('../models/User');
 const Word = require('../models/Word');
+const UserWordProgress = require('../models/UserWordProgress');
 
 const SHEET_PATH = path.join(__dirname, '..', 'data', 'seed_words_sheet.csv');
 
@@ -71,10 +72,34 @@ async function getSeedUser() {
 async function cleanupLegacyIndexes() {
   const indexes = await Word.collection.indexes();
   const legacyWordIndex = indexes.find((idx) => idx.key && idx.key.word === 1);
+  const legacyEnglishWordUniqueIndex = indexes.find(
+    (idx) => idx.key && idx.key.englishWord === 1 && idx.unique && !idx.partialFilterExpression
+  );
 
   if (legacyWordIndex) {
     await Word.collection.dropIndex(legacyWordIndex.name);
     console.log(`Dropped legacy index: ${legacyWordIndex.name}`);
+  }
+
+  if (legacyEnglishWordUniqueIndex) {
+    await Word.collection.dropIndex(legacyEnglishWordUniqueIndex.name);
+    console.log(`Dropped outdated englishWord unique index: ${legacyEnglishWordUniqueIndex.name}`);
+  }
+
+  try {
+    await Word.collection.createIndex(
+      { englishWord: 1 },
+      {
+        unique: true,
+        // Some MongoDB deployments reject $ne in partial indexes.
+        partialFilterExpression: { englishWord: { $exists: true, $gt: '' } },
+        name: 'englishWord_1',
+      }
+    );
+  } catch (error) {
+    console.warn(`Failed to create partial unique index for englishWord: ${error.message}`);
+    // Fallback: still keep a usable index so seed can continue.
+    await Word.collection.createIndex({ englishWord: 1 }, { name: 'englishWord_1' });
   }
 }
 
@@ -117,6 +142,8 @@ async function seedWords() {
 
   let createdCount = 0;
   let updatedCount = 0;
+  let progressCreatedCount = 0;
+  let progressUpdatedCount = 0;
 
   for (let i = 1; i < lines.length; i += 1) {
     const row = parseCsvLine(lines[i]);
@@ -138,20 +165,59 @@ async function seedWords() {
 
     const existing = await Word.findOne({ englishWord });
 
+    let wordId;
+
     if (!existing) {
-      await Word.create({
+      const createdWord = await Word.create({
         ...updateData,
         englishWord,
         createdBy: seedUser._id,
       });
       createdCount += 1;
+      wordId = createdWord._id;
     } else {
       await Word.updateOne({ _id: existing._id }, { $set: updateData });
       updatedCount += 1;
+      wordId = existing._id;
+    }
+
+    if (!wordId) {
+      // Skip progress sync if word could not be resolved for any reason.
+      // This avoids stopping the whole seed process for one malformed row.
+      continue;
+    }
+
+    const progressResult = await UserWordProgress.updateOne(
+      { userId: seedUser._id, wordId },
+      {
+        $set: {
+          level: updateData.level,
+          isPublic: true,
+          personalEnglishWord: englishWord,
+          personalVietnameseWord: updateData.vietnameseWord,
+        },
+        $setOnInsert: {
+          addedAt: new Date(),
+          personalNote: '',
+          personalTags: [],
+          correctStreak: 0,
+          incorrectStreak: 0,
+        },
+      },
+      { upsert: true }
+    );
+
+    if (progressResult.upsertedCount > 0) {
+      progressCreatedCount += 1;
+    } else {
+      progressUpdatedCount += 1;
     }
   }
 
-  console.log(`Seed completed. Created: ${createdCount}, Updated: ${updatedCount}`);
+  console.log(
+    `Seed completed. Words Created: ${createdCount}, Words Updated: ${updatedCount}, ` +
+      `Progress Created: ${progressCreatedCount}, Progress Updated: ${progressUpdatedCount}`
+  );
   await mongoose.connection.close();
 }
 

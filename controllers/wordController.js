@@ -13,27 +13,166 @@ const pickRandom = (items, count) => {
   return shuffled.slice(0, count);
 };
 
+const normalizeWordInput = (value) => (typeof value === 'string' ? value.trim() : '');
+
+const toObjectIdStrings = (ids) => ids.map((id) => id.toString());
+
+const buildAccessQueryForWords = async (user) => {
+  if (user?.role === 'admin') {
+    return {};
+  }
+
+  const publicWordIds = await UserWordProgress.distinct('wordId', { isPublic: true });
+  const publicWordIdStrings = toObjectIdStrings(publicWordIds);
+
+  if (!user?.id) {
+    return {
+      _id: { $in: publicWordIdStrings },
+    };
+  }
+
+  const savedWordIds = await UserWordProgress.distinct('wordId', { userId: user.id });
+  const mergedWordIds = [...new Set([...toObjectIdStrings(savedWordIds), ...publicWordIdStrings])];
+
+  return {
+    $or: [
+      { createdBy: user.id },
+      { _id: { $in: mergedWordIds } },
+    ],
+  };
+};
+
+const canUserAccessWord = async (user, word) => {
+  if (user?.role === 'admin') return true;
+
+  const wordId = word._id.toString();
+  if (user?.id && word.createdBy?.toString() === user.id) return true;
+
+  if (user?.id) {
+    const saved = await UserWordProgress.exists({ userId: user.id, wordId });
+    if (saved) return true;
+  }
+
+  const isPublic = await UserWordProgress.exists({ wordId, isPublic: true });
+  return !!isPublic;
+};
+
+const buildReviewResponse = ({ mode, filterType, filterValue, candidates, selected }) => ({
+  mode,
+  filter: {
+    type: filterType,
+    value: filterValue,
+  },
+  totalCandidates: candidates.length,
+  count: selected.length,
+  words: selected,
+});
+
+const buildWordFromProgress = (record) => {
+  const baseWord = record.wordId?.toObject?.() || null;
+  if (!baseWord) return null;
+
+  const personalEnglishWord = normalizeWordInput(record.personalEnglishWord);
+  const personalVietnameseWord = normalizeWordInput(record.personalVietnameseWord);
+
+  return {
+    ...baseWord,
+    englishWord: personalEnglishWord || baseWord.englishWord || '',
+    vietnameseWord: personalVietnameseWord || baseWord.vietnameseWord || '',
+    isPublic: !!record.isPublic,
+    personalLevel: record.level,
+    personalNote: record.personalNote || '',
+    personalTags: Array.isArray(record.personalTags) ? record.personalTags : [],
+    addedAt: record.addedAt,
+    lastReviewedAt: record.lastReviewedAt || null,
+  };
+};
+
+const getMyVocabularyWords = async (userId, count) => {
+  const progressRecords = await UserWordProgress.find({ userId })
+    .sort({ updatedAt: -1 })
+    .limit(count)
+    .populate({ path: 'wordId', populate: { path: 'createdBy', select: 'username' } });
+
+  return progressRecords.map(buildWordFromProgress).filter(Boolean);
+};
+
+const getUserProgressWordsByTopic = async (userId, topic) => {
+  const progressRecords = await UserWordProgress.find({ userId })
+    .populate({
+      path: 'wordId',
+      match: { topics: topic },
+      populate: { path: 'createdBy', select: 'username' },
+    });
+
+  return progressRecords.map(buildWordFromProgress).filter(Boolean);
+};
+
+const getUserProgressWordsByLevel = async (userId, level) => {
+  const progressRecords = await UserWordProgress.find({ userId, level })
+    .populate({ path: 'wordId', populate: { path: 'createdBy', select: 'username' } });
+
+  return progressRecords.map(buildWordFromProgress).filter(Boolean);
+};
+
+const getCommunityWords = async ({ count, topic, level }) => {
+  const wordMatch = {};
+  if (topic) wordMatch.topics = topic;
+  if (level !== undefined) wordMatch.level = level;
+
+  const progressRecords = await UserWordProgress.find({ isPublic: true })
+    .sort({ updatedAt: -1 })
+    .limit(count)
+    .populate({
+      path: 'wordId',
+      match: wordMatch,
+      populate: { path: 'createdBy', select: 'username' },
+    })
+    .populate('userId', 'username');
+
+  return progressRecords
+    .map((record) => {
+      const word = buildWordFromProgress(record);
+      if (!word) return null;
+
+      return {
+        sourceEntryId: record._id,
+        ...word,
+        sharedBy: record.userId
+          ? { _id: record.userId._id, username: record.userId.username }
+          : null,
+      };
+    })
+    .filter(Boolean);
+};
+
 // Tạo từ mới
 exports.createWord = async (req, res) => {
   try {
     const { englishWord, vietnameseWord, topics, level } = req.body;
+    const normalizedEnglishWord = normalizeWordInput(englishWord).toLowerCase();
+    const normalizedVietnameseWord = normalizeWordInput(vietnameseWord);
 
-    if (!englishWord) {
-      return res.status(400).json({ message: 'English word is required' });
+    if (!normalizedEnglishWord || !normalizedVietnameseWord) {
+      return res.status(400).json({ message: 'Both englishWord and vietnameseWord are required' });
     }
 
-    // Kiểm tra từ đã tồn tại
-    const existingWord = await Word.findOne({ englishWord: englishWord.toLowerCase() });
-    if (existingWord) {
-      return res.status(400).json({ message: 'Word already exists' });
+    if (normalizedEnglishWord) {
+      // Kiểm tra từ đã tồn tại theo englishWord khi có cung cấp
+      const existingWord = await Word.findOne({ englishWord: normalizedEnglishWord });
+      if (existingWord) {
+        return res.status(400).json({ message: 'Word already exists' });
+      }
     }
 
-    // Lấy thông tin từ từ Dictionary API hoặc Gemini
-    const enrichedData = await enrichWord(englishWord, vietnameseWord);
+    // Chỉ enrichment khi có englishWord để tránh gọi API không hợp lệ.
+    const enrichedData = normalizedEnglishWord
+      ? await enrichWord(normalizedEnglishWord, normalizedVietnameseWord)
+      : {};
 
     const word = new Word({
-      englishWord: englishWord.toLowerCase(),
-      vietnameseWord: vietnameseWord || '',
+      englishWord: normalizedEnglishWord || undefined,
+      vietnameseWord: normalizedVietnameseWord || '',
       pronunciation: enrichedData.pronunciation || '',
       partOfSpeech: enrichedData.partOfSpeech || '',
       definitions: enrichedData.definitions || [],
@@ -65,17 +204,55 @@ exports.createWord = async (req, res) => {
 
 exports.addToMyVocabulary = async (req, res) => {
   try {
+    const { sourceEntryId, sourceUserId } = req.body || {};
     const word = await Word.findById(req.params.id);
     if (!word) {
       return res.status(404).json({ message: 'Word not found' });
+    }
+
+    const isOwner = word.createdBy?.toString() === req.user.id;
+    const isAdmin = req.user.role === 'admin';
+    const isPublic = await UserWordProgress.exists({ wordId: word._id, isPublic: true });
+
+    if (!isAdmin && !isOwner && !isPublic) {
+      return res.status(403).json({ message: 'You can only save your own words or words that are public' });
+    }
+
+    let sourcePublicEntry = null;
+    if (sourceEntryId) {
+      sourcePublicEntry = await UserWordProgress.findOne({
+        _id: sourceEntryId,
+        wordId: word._id,
+        isPublic: true,
+      });
+
+      if (!sourcePublicEntry) {
+        return res.status(400).json({ message: 'Source public entry not found' });
+      }
+    } else if (sourceUserId) {
+      // Backward compatibility for FE that still sends sourceUserId.
+      sourcePublicEntry = await UserWordProgress.findOne({
+        userId: sourceUserId,
+        wordId: word._id,
+        isPublic: true,
+      });
+
+      if (!sourcePublicEntry) {
+        return res.status(400).json({ message: 'Source public entry not found' });
+      }
     }
 
     const result = await UserWordProgress.updateOne(
       { userId: req.user.id, wordId: word._id },
       {
         $setOnInsert: {
-          level: word.level || 3,
+          level: sourcePublicEntry?.level || word.level || 3,
           addedAt: new Date(),
+          personalEnglishWord: sourcePublicEntry?.personalEnglishWord || '',
+          personalVietnameseWord: sourcePublicEntry?.personalVietnameseWord || '',
+          personalNote: sourcePublicEntry?.personalNote || '',
+          personalTags: Array.isArray(sourcePublicEntry?.personalTags) ? sourcePublicEntry.personalTags : [],
+          isPublic: false,
         },
       },
       { upsert: true }
@@ -85,7 +262,127 @@ exports.addToMyVocabulary = async (req, res) => {
     return res.json({
       message: isAddedNow ? 'Word added to your vocabulary' : 'Word already exists in your vocabulary',
       wordId: word._id,
+      isPublic: false,
     });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+exports.removeFromMyVocabulary = async (req, res) => {
+  try {
+    const { wordId } = req.params;
+
+    const result = await UserWordProgress.deleteOne({
+      userId: req.user.id,
+      wordId,
+    });
+
+    if (result.deletedCount === 0) {
+      return res.status(404).json({ message: 'Word is not in your vocabulary' });
+    }
+
+    return res.json({ message: 'Word removed from your vocabulary', wordId });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+exports.updateMyVocabularyEntry = async (req, res) => {
+  try {
+    const { wordId } = req.params;
+    const {
+      personalLevel,
+      level,
+      personalNote,
+      personalTags,
+      englishWord,
+      vietnameseWord,
+      isPublic,
+    } = req.body;
+
+    const nextLevel = personalLevel ?? level;
+    if (nextLevel !== undefined) {
+      const parsedLevel = parseInt(nextLevel, 10);
+      if (Number.isNaN(parsedLevel) || parsedLevel < 1 || parsedLevel > 6) {
+        return res.status(400).json({ message: 'personalLevel must be an integer from 1 to 6' });
+      }
+    }
+
+    if (personalTags !== undefined && !Array.isArray(personalTags)) {
+      return res.status(400).json({ message: 'personalTags must be an array of strings' });
+    }
+
+    if (isPublic !== undefined && typeof isPublic !== 'boolean') {
+      return res.status(400).json({ message: 'isPublic must be a boolean' });
+    }
+
+    if (englishWord !== undefined && !normalizeWordInput(englishWord)) {
+      return res.status(400).json({ message: 'englishWord cannot be empty when provided' });
+    }
+
+    if (vietnameseWord !== undefined && !normalizeWordInput(vietnameseWord)) {
+      return res.status(400).json({ message: 'vietnameseWord cannot be empty when provided' });
+    }
+
+    const updateData = {};
+    if (nextLevel !== undefined) {
+      updateData.level = parseInt(nextLevel, 10);
+    }
+    if (personalNote !== undefined) {
+      updateData.personalNote = normalizeWordInput(personalNote);
+    }
+    if (personalTags !== undefined) {
+      updateData.personalTags = personalTags
+        .filter((item) => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+    if (englishWord !== undefined) {
+      updateData.personalEnglishWord = normalizeWordInput(englishWord).toLowerCase();
+    }
+    if (vietnameseWord !== undefined) {
+      updateData.personalVietnameseWord = normalizeWordInput(vietnameseWord);
+    }
+    if (isPublic !== undefined) {
+      updateData.isPublic = isPublic;
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return res.status(400).json({ message: 'No update fields provided' });
+    }
+
+    const progress = await UserWordProgress.findOneAndUpdate(
+      { userId: req.user.id, wordId },
+      { $set: updateData },
+      { new: true }
+    ).populate({ path: 'wordId', populate: { path: 'createdBy', select: 'username' } });
+
+    if (!progress || !progress.wordId) {
+      return res.status(404).json({ message: 'Word is not in your vocabulary' });
+    }
+
+    return res.json({
+      message: 'My vocabulary entry updated',
+      word: buildWordFromProgress(progress),
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+exports.getCommunityWords = async (req, res) => {
+  try {
+    const count = toPositiveInt(req.query.count, 20);
+    const { topic } = req.query;
+    const level = req.query.level !== undefined ? parseInt(req.query.level, 10) : undefined;
+
+    if (level !== undefined && (Number.isNaN(level) || level < 1 || level > 6)) {
+      return res.status(400).json({ message: 'level must be an integer from 1 to 6' });
+    }
+
+    const words = await getCommunityWords({ count, topic, level });
+    return res.json({ words, count: words.length });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -121,13 +418,15 @@ exports.reviewByTopic = async (req, res) => {
     }
 
     const selected = pickRandom(words, count);
-    return res.json({
-      mode: mineOnly && req.user?.id ? 'my-vocabulary' : 'public',
-      topic,
-      totalCandidates: words.length,
-      count: selected.length,
-      words: selected,
-    });
+    return res.json(
+      buildReviewResponse({
+        mode: mineOnly && req.user?.id ? 'my-vocabulary' : 'public',
+        filterType: 'topic',
+        filterValue: topic,
+        candidates: words,
+        selected,
+      })
+    );
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -159,13 +458,81 @@ exports.reviewByLevel = async (req, res) => {
     }
 
     const selected = pickRandom(words, count);
+    return res.json(
+      buildReviewResponse({
+        mode: mineOnly && req.user?.id ? 'my-vocabulary' : 'public',
+        filterType: 'level',
+        filterValue: level,
+        candidates: words,
+        selected,
+      })
+    );
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+exports.getMyVocabulary = async (req, res) => {
+  try {
+    const count = toPositiveInt(req.query.count, 10);
+    const words = await getMyVocabularyWords(req.user.id, count);
+
     return res.json({
-      mode: mineOnly && req.user?.id ? 'my-vocabulary' : 'public',
-      level,
-      totalCandidates: words.length,
-      count: selected.length,
-      words: selected,
+      words,
+      count: words.length,
     });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+exports.reviewMyVocabByTopic = async (req, res) => {
+  try {
+    const { topic } = req.query;
+    const count = toPositiveInt(req.query.count, 10);
+
+    if (!topic) {
+      return res.status(400).json({ message: 'topic is required' });
+    }
+
+    const words = await getUserProgressWordsByTopic(req.user.id, topic);
+    const selected = pickRandom(words, count);
+
+    return res.json(
+      buildReviewResponse({
+        mode: 'my-vocabulary',
+        filterType: 'topic',
+        filterValue: topic,
+        candidates: words,
+        selected,
+      })
+    );
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+exports.reviewMyVocabByLevel = async (req, res) => {
+  try {
+    const level = parseInt(req.query.level, 10);
+    const count = toPositiveInt(req.query.count, 10);
+
+    if (Number.isNaN(level) || level < 1 || level > 6) {
+      return res.status(400).json({ message: 'level must be an integer from 1 to 6' });
+    }
+
+    const words = await getUserProgressWordsByLevel(req.user.id, level);
+    const selected = pickRandom(words, count);
+
+    return res.json(
+      buildReviewResponse({
+        mode: 'my-vocabulary',
+        filterType: 'level',
+        filterValue: level,
+        candidates: words,
+        selected,
+      })
+    );
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -175,10 +542,17 @@ exports.reviewByLevel = async (req, res) => {
 exports.getAllWords = async (req, res) => {
   try {
     const { level, topic, limit = 20, skip = 0 } = req.query;
-    let query = {};
+    const accessQuery = await buildAccessQueryForWords(req.user);
+    const queryConditions = [];
 
-    if (level) query.level = parseInt(level);
-    if (topic) query.topics = topic;
+    if (Object.keys(accessQuery).length > 0) {
+      queryConditions.push(accessQuery);
+    }
+
+    if (level) queryConditions.push({ level: parseInt(level, 10) });
+    if (topic) queryConditions.push({ topics: topic });
+
+    const query = queryConditions.length > 0 ? { $and: queryConditions } : {};
 
     const words = await Word.find(query)
       .limit(parseInt(limit))
@@ -200,6 +574,12 @@ exports.getWordById = async (req, res) => {
     if (!word) {
       return res.status(404).json({ message: 'Word not found' });
     }
+
+    const canAccess = await canUserAccessWord(req.user, word);
+    if (!canAccess) {
+      return res.status(403).json({ message: 'You do not have permission to access this word' });
+    }
+
     res.json(word);
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -283,30 +663,47 @@ exports.recordInteraction = async (req, res) => {
         $setOnInsert: {
           level: word.level || 3,
           addedAt: new Date(),
+          isPublic: false,
+          correctStreak: 0,
+          incorrectStreak: 0,
         },
       },
       { upsert: true, new: true }
     );
 
-    // Cập nhật độ khó của từ dựa trên tương tác
-    const recentInteractions = await Interaction.find({ wordId: wordId, userId: req.user.id })
-      .sort({ createdAt: -1 })
-      .limit(2);
+    if (typeof progress.correctStreak !== 'number') progress.correctStreak = 0;
+    if (typeof progress.incorrectStreak !== 'number') progress.incorrectStreak = 0;
 
-    let newLevel = progress.level;
+    // Rule mới:
+    // - Sai 2 lần liên tiếp mới tăng level.
+    // - Đúng 5 lần liên tiếp mới giảm level.
     if (isCorrect === false) {
-      newLevel = Math.min(6, progress.level + 1);
-    } else if (isCorrect === true && recentInteractions.length >= 2) {
-      if (recentInteractions[0].isCorrect && recentInteractions[1].isCorrect) {
-        newLevel = Math.max(1, progress.level - 1);
+      progress.incorrectStreak += 1;
+      progress.correctStreak = 0;
+
+      if (progress.incorrectStreak >= 2) {
+        progress.level = Math.min(6, progress.level + 1);
+        progress.incorrectStreak = 0;
+      }
+    } else {
+      progress.correctStreak += 1;
+      progress.incorrectStreak = 0;
+
+      if (progress.correctStreak >= 5) {
+        progress.level = Math.max(1, progress.level - 1);
+        progress.correctStreak = 0;
       }
     }
 
-    progress.level = newLevel;
     progress.lastReviewedAt = new Date();
     await progress.save();
 
-    res.json({ message: 'Interaction recorded', newLevel: progress.level });
+    res.json({
+      message: 'Interaction recorded',
+      newLevel: progress.level,
+      correctStreak: progress.correctStreak,
+      incorrectStreak: progress.incorrectStreak,
+    });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
