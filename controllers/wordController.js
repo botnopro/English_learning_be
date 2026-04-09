@@ -8,9 +8,64 @@ const toPositiveInt = (value, fallback) => {
   return Number.isNaN(parsed) || parsed <= 0 ? fallback : parsed;
 };
 
-const pickRandom = (items, count) => {
-  const shuffled = [...items].sort(() => 0.5 - Math.random());
-  return shuffled.slice(0, count);
+const REVIEW_LEVEL_WEIGHTS = {
+  1: 30,
+  2: 40,
+  3: 50,
+  4: 60,
+  5: 80,
+  6: 100,
+};
+
+const shuffle = (items) => {
+  const shuffled = [...items];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const randomIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[randomIndex]] = [shuffled[randomIndex], shuffled[index]];
+  }
+  return shuffled;
+};
+
+const getEffectiveLevel = (word) => {
+  const parsedLevel = parseInt(word?.personalLevel ?? word?.level, 10);
+  if (Number.isNaN(parsedLevel) || parsedLevel < 1 || parsedLevel > 6) {
+    return 3;
+  }
+  return parsedLevel;
+};
+
+const pickWeightedByLevel = (items, count) => {
+  if (!Array.isArray(items) || items.length === 0 || count <= 0) {
+    return [];
+  }
+
+  const pool = [...items];
+  const selected = [];
+  const targetCount = Math.min(count, pool.length);
+
+  while (selected.length < targetCount && pool.length > 0) {
+    const weightedPool = pool.map((item) => ({
+      item,
+      weight: REVIEW_LEVEL_WEIGHTS[getEffectiveLevel(item)] || REVIEW_LEVEL_WEIGHTS[3],
+    }));
+
+    const totalWeight = weightedPool.reduce((sum, entry) => sum + entry.weight, 0);
+    let threshold = Math.random() * totalWeight;
+    let selectedIndex = 0;
+
+    for (let index = 0; index < weightedPool.length; index += 1) {
+      threshold -= weightedPool[index].weight;
+      if (threshold <= 0) {
+        selectedIndex = index;
+        break;
+      }
+    }
+
+    selected.push(weightedPool[selectedIndex].item);
+    pool.splice(selectedIndex, 1);
+  }
+
+  return shuffle(selected);
 };
 
 const normalizeWordInput = (value) => (typeof value === 'string' ? value.trim() : '');
@@ -90,11 +145,10 @@ const buildWordFromProgress = (record) => {
 
 const getMyVocabularyWords = async (userId, count) => {
   const progressRecords = await UserWordProgress.find({ userId })
-    .sort({ updatedAt: -1 })
-    .limit(count)
     .populate({ path: 'wordId', populate: { path: 'createdBy', select: 'username' } });
 
-  return progressRecords.map(buildWordFromProgress).filter(Boolean);
+  const builtWords = progressRecords.map(buildWordFromProgress).filter(Boolean);
+  return pickWeightedByLevel(builtWords, count);
 };
 
 const getUserProgressWordsByTopic = async (userId, topic) => {
@@ -417,7 +471,7 @@ exports.reviewByTopic = async (req, res) => {
       words = await Word.find({ topics: topic }).populate('createdBy', 'username');
     }
 
-    const selected = pickRandom(words, count);
+    const selected = pickWeightedByLevel(words, count);
     return res.json(
       buildReviewResponse({
         mode: mineOnly && req.user?.id ? 'my-vocabulary' : 'public',
@@ -457,7 +511,7 @@ exports.reviewByLevel = async (req, res) => {
       words = await Word.find({ level }).populate('createdBy', 'username');
     }
 
-    const selected = pickRandom(words, count);
+    const selected = pickWeightedByLevel(words, count);
     return res.json(
       buildReviewResponse({
         mode: mineOnly && req.user?.id ? 'my-vocabulary' : 'public',
@@ -496,7 +550,7 @@ exports.reviewMyVocabByTopic = async (req, res) => {
     }
 
     const words = await getUserProgressWordsByTopic(req.user.id, topic);
-    const selected = pickRandom(words, count);
+    const selected = pickWeightedByLevel(words, count);
 
     return res.json(
       buildReviewResponse({
@@ -522,7 +576,7 @@ exports.reviewMyVocabByLevel = async (req, res) => {
     }
 
     const words = await getUserProgressWordsByLevel(req.user.id, level);
-    const selected = pickRandom(words, count);
+    const selected = pickWeightedByLevel(words, count);
 
     return res.json(
       buildReviewResponse({
@@ -644,6 +698,10 @@ exports.recordInteraction = async (req, res) => {
     const { isCorrect } = req.body;
     const wordId = req.params.id;
 
+    if (typeof isCorrect !== 'boolean') {
+      return res.status(400).json({ message: 'isCorrect must be a boolean' });
+    }
+
     const word = await Word.findById(wordId);
     if (!word) {
       return res.status(404).json({ message: 'Word not found' });
@@ -675,13 +733,13 @@ exports.recordInteraction = async (req, res) => {
     if (typeof progress.incorrectStreak !== 'number') progress.incorrectStreak = 0;
 
     // Rule mới:
-    // - Sai 2 lần liên tiếp mới tăng level.
+    // - Sai 3 lần liên tiếp mới tăng level.
     // - Đúng 5 lần liên tiếp mới giảm level.
     if (isCorrect === false) {
       progress.incorrectStreak += 1;
       progress.correctStreak = 0;
 
-      if (progress.incorrectStreak >= 2) {
+      if (progress.incorrectStreak >= 3) {
         progress.level = Math.min(6, progress.level + 1);
         progress.incorrectStreak = 0;
       }
