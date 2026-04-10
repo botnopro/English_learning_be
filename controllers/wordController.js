@@ -10,10 +10,10 @@ const toPositiveInt = (value, fallback) => {
 
 const REVIEW_LEVEL_WEIGHTS = {
   1: 10,
-  2: 30,
-  3: 50,
-  4: 60,
-  5: 80,
+  2: 50,
+  3: 70,
+  4: 80,
+  5: 90,
   6: 100,
 };
 
