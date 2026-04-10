@@ -698,12 +698,28 @@ exports.recordInteraction = async (req, res) => {
     const { isCorrect } = req.body;
     const wordId = req.params.id;
 
+    console.log('[recordInteraction] request_received', {
+      userId: req.user?.id,
+      wordId,
+      isCorrect,
+      timestamp: new Date().toISOString(),
+    });
+
     if (typeof isCorrect !== 'boolean') {
+      console.warn('[recordInteraction] invalid_payload', {
+        userId: req.user?.id,
+        wordId,
+        isCorrect,
+      });
       return res.status(400).json({ message: 'isCorrect must be a boolean' });
     }
 
     const word = await Word.findById(wordId);
     if (!word) {
+      console.warn('[recordInteraction] word_not_found', {
+        userId: req.user?.id,
+        wordId,
+      });
       return res.status(404).json({ message: 'Word not found' });
     }
 
@@ -714,6 +730,13 @@ exports.recordInteraction = async (req, res) => {
       isCorrect: isCorrect
     });
     await interaction.save();
+
+    console.log('[recordInteraction] interaction_saved', {
+      interactionId: interaction._id,
+      userId: req.user?.id,
+      wordId,
+      isCorrect,
+    });
 
     const progress = await UserWordProgress.findOneAndUpdate(
       { userId: req.user.id, wordId: wordId },
@@ -728,6 +751,8 @@ exports.recordInteraction = async (req, res) => {
       },
       { upsert: true, new: true }
     );
+
+    const previousLevel = progress.level || word.level || 3;
 
     if (typeof progress.correctStreak !== 'number') progress.correctStreak = 0;
     if (typeof progress.incorrectStreak !== 'number') progress.incorrectStreak = 0;
@@ -756,13 +781,44 @@ exports.recordInteraction = async (req, res) => {
     progress.lastReviewedAt = new Date();
     await progress.save();
 
+    const [totalInteractions, totalCorrect, totalIncorrect] = await Promise.all([
+      Interaction.countDocuments({ userId: req.user.id, wordId }),
+      Interaction.countDocuments({ userId: req.user.id, wordId, isCorrect: true }),
+      Interaction.countDocuments({ userId: req.user.id, wordId, isCorrect: false }),
+    ]);
+
+    console.log('[recordInteraction] progress_updated', {
+      userId: req.user?.id,
+      wordId,
+      previousLevel,
+      level: progress.level,
+      correctStreak: progress.correctStreak,
+      incorrectStreak: progress.incorrectStreak,
+      totalInteractions,
+      totalCorrect,
+      totalIncorrect,
+      lastReviewedAt: progress.lastReviewedAt,
+    });
+
     res.json({
       message: 'Interaction recorded',
+      wordId,
+      isCorrect,
+      previousLevel,
       newLevel: progress.level,
       correctStreak: progress.correctStreak,
       incorrectStreak: progress.incorrectStreak,
+      totalInteractions,
+      totalCorrect,
+      totalIncorrect,
+      reviewedAt: progress.lastReviewedAt,
     });
   } catch (error) {
+    console.error('[recordInteraction] unexpected_error', {
+      userId: req.user?.id,
+      wordId: req.params?.id,
+      message: error.message,
+    });
     res.status(500).json({ message: error.message });
   }
 };
